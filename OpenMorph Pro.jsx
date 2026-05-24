@@ -1360,9 +1360,657 @@
     }
 
     // =========================================================================
-    //  UI  —  Compact Tabbed Panel
-    //  Three tabs: Single / Chain / Multi
-    //  Numbered steps (① ②) guide the user through each workflow
+    //  BOOLEAN-AWARE KEYFRAME OPTIMIZER  (Lockwood / ShapeShifter technique)
+    //
+    //  Fixes the "shards" / "twisting" distortion that appears when an
+    //  already-keyframed multi-sub-path shape (e.g. boat hull + sails) morphs.
+    //
+    //  Workflow:
+    //    1.  User selects ONE Path property in the timeline that has ≥2 keyframes.
+    //    2.  We walk up to its parent "Vectors Group" container.
+    //    3.  Every sibling path inside that container is collected.
+    //    4.  Each path's keyframes (or static value, for newly-added siblings)
+    //        are forced to the same winding order, then NW-aligned so vertices
+    //        travel the minimum distance between poses.
+    //    5.  Static siblings get a collapsed-dummy keyframe at t0 → they "grow"
+    //        out of the main shape's centre instead of popping in.
+    //    6.  The container's Fill is switched to Even-Odd so inner sub-paths act
+    //        as cutouts automatically (no Merge Paths operator required).
+    //    7.  Keyframes are eased to 75 % for that polished look.
+    // =========================================================================
+    function readPathSnapshot(s) {
+        var pd = { vertices: [], inTangents: [], outTangents: [], closed: s.closed };
+        for (var k = 0; k < s.vertices.length; k++) {
+            pd.vertices.push([s.vertices[k][0], s.vertices[k][1]]);
+            pd.inTangents.push([s.inTangents[k][0], s.inTangents[k][1]]);
+            pd.outTangents.push([s.outTangents[k][0], s.outTangents[k][1]]);
+        }
+        return pd;
+    }
+
+    function pathBBoxCenter(pd) {
+        var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (var k = 0; k < pd.vertices.length; k++) {
+            var v = pd.vertices[k];
+            if (v[0] < minX) minX = v[0]; if (v[0] > maxX) maxX = v[0];
+            if (v[1] < minY) minY = v[1]; if (v[1] > maxY) maxY = v[1];
+        }
+        if (minX === Infinity) return { center: [0, 0], area: 0 };
+        return { center: [(minX + maxX) / 2, (minY + maxY) / 2], area: (maxX - minX) * (maxY - minY) };
+    }
+
+    // collapsedDummy already exists for the writer; this variant lets us place
+    // the dummy at an arbitrary anchor point in path-local space.
+    function collapsedDummyAt(vertCount, closed, cx, cy) {
+        var v = [], i = [], o = [];
+        for (var k = 0; k < vertCount; k++) {
+            v.push([cx, cy]); i.push([0, 0]); o.push([0, 0]);
+        }
+        return { vertices: v, inTangents: i, outTangents: o, closed: closed !== false };
+    }
+
+    // Walk up the property chain until we hit an "ADBE Vectors Group" — that's
+    // the container that holds the Fill and all sibling Vector Shape - Groups.
+    function findContainerVectorsGroup(pathProp) {
+        var p = pathProp;
+        // Climb a few levels — Vector Shape → Vector Shape - Group → Vectors Group
+        for (var hop = 0; hop < 6 && p; hop++) {
+            var mn = "";
+            try { mn = p.matchName; } catch (e) { break; }
+            if (mn === "ADBE Vectors Group") return p;
+            try { p = p.parentProperty; } catch (e) { break; }
+        }
+        return null;
+    }
+
+    function collectShapePathsInGroup(vectorsGroup) {
+        var paths = [];
+        function recurse(prop) {
+            var mn = "";
+            try { mn = prop.matchName; } catch (e) { return; }
+            if (mn === "ADBE Vector Shape") { paths.push(prop); return; }
+            // Don't dive into another container's siblings — but DO traverse
+            // Vector Shape - Group wrappers and nested Vector Group/Vectors Group.
+            var n = 0; try { n = prop.numProperties; } catch (e) { return; }
+            for (var i = 1; i <= n; i++) {
+                try { recurse(prop.property(i)); } catch (e) { }
+            }
+        }
+        recurse(vectorsGroup);
+        return paths;
+    }
+
+    // Find every Fill property living directly in this Vectors Group (one level deep).
+    function collectFillsInGroup(vectorsGroup) {
+        var fills = [];
+        var n = 0; try { n = vectorsGroup.numProperties; } catch (e) { return fills; }
+        for (var i = 1; i <= n; i++) {
+            try {
+                var child = vectorsGroup.property(i);
+                var mn = ""; try { mn = child.matchName; } catch (e) { continue; }
+                if (mn === "ADBE Vector Graphic - Fill") fills.push(child);
+            } catch (e) { }
+        }
+        return fills;
+    }
+
+    function optimizeBooleanKeys() {
+        var comp = app.project.activeItem;
+        if (!comp || !(comp instanceof CompItem)) return "Open a composition first.";
+        var sel = comp.selectedProperties;
+        if (!sel || !sel.length) return "Select a Path property with 2 keyframes.";
+
+        // Find a keyframed Bezier path in the user's selection
+        var seedPath = null;
+        for (var i = 0; i < sel.length; i++) {
+            var sp = sel[i];
+            try {
+                if (sp.matchName === "ADBE Vector Shape" && sp.numKeys >= 2) {
+                    seedPath = sp; break;
+                }
+            } catch (e) { }
+        }
+        if (!seedPath) return "Select a Bezier Path property that has 2+ keyframes.";
+
+        var t0 = seedPath.keyTime(1);
+        var t1 = seedPath.keyTime(2);
+        if (t1 <= t0) return "Keyframes must be at different times.";
+
+        var container = findContainerVectorsGroup(seedPath);
+        if (!container) return "Could not locate the parent Vectors Group.";
+
+        var siblings = collectShapePathsInGroup(container);
+        if (!siblings.length) return "No sibling paths found in the container.";
+
+        app.beginUndoGroup("OM: Optimize Boolean Keys");
+
+        // ── Snapshot every sibling at t0 and t1 ───────────────────────────────
+        // animated=true  → uses its own keyframes 1 & 2 (re-mapped to seed t0/t1)
+        // animated=false → static value re-used at both ends; later replaced by
+        //                  a collapsed dummy at t0 so it grows from the centre.
+        var samples = [];
+        var staticPaths = [];
+        for (var s = 0; s < siblings.length; s++) {
+            var pp = siblings[s];
+            var animated = false;
+            try { animated = pp.numKeys >= 2; } catch (e) { }
+            var kf0, kf1;
+            if (animated) {
+                kf0 = readPathSnapshot(pp.valueAtTime(pp.keyTime(1), false));
+                kf1 = readPathSnapshot(pp.valueAtTime(pp.keyTime(2), false));
+            } else {
+                var staticVal = readPathSnapshot(pp.valueAtTime(t0, false));
+                kf0 = staticVal; kf1 = staticVal;
+                staticPaths.push(samples.length);
+            }
+            samples.push({ prop: pp, kf0: kf0, kf1: kf1, animated: animated });
+        }
+
+        // ── Determine the "main shape" centre (largest bbox at t0 amongst the
+        //    animated paths). Used as the spawn point for collapsed dummies.
+        var mainArea = -1, mainCenter = [0, 0];
+        for (var s = 0; s < samples.length; s++) {
+            if (!samples[s].animated) continue;
+            var bb = pathBBoxCenter(samples[s].kf0);
+            if (bb.area > mainArea) { mainArea = bb.area; mainCenter = bb.center; }
+        }
+        // Fallback: if every sibling is static, just use the first one's bbox.
+        if (mainArea < 0 && samples.length) {
+            var bb0 = pathBBoxCenter(samples[0].kf0);
+            mainCenter = bb0.center;
+        }
+
+        // ── Force a single, consistent winding order across every keyframe.
+        //    AE's Y-axis points down, so a visually-CW polygon has signedArea > 0.
+        function forceCW(pd) {
+            return signedArea(pd) < 0 ? reversePath(pd) : pd;
+        }
+        for (var s = 0; s < samples.length; s++) {
+            samples[s].kf0 = forceCW(samples[s].kf0);
+            samples[s].kf1 = forceCW(samples[s].kf1);
+        }
+
+        // ── Replace t0 keyframe of static siblings with a collapsed dummy at
+        //    the main shape's centre — Lockwood's "grow from a single point" trick.
+        for (var idx = 0; idx < staticPaths.length; idx++) {
+            var sIdx = staticPaths[idx];
+            var tgtPd = samples[sIdx].kf1;
+            samples[sIdx].kf0 = collapsedDummyAt(tgtPd.vertices.length, tgtPd.closed,
+                                                  mainCenter[0], mainCenter[1]);
+        }
+
+        // ── NW-align each pose pair (after lifting density to CFG.minVertices). ─
+        var aligned = [];
+        for (var s = 0; s < samples.length; s++) {
+            var a = samples[s].kf0, b = samples[s].kf1;
+            var preA = a.vertices.length >= CFG.minVertices ? a : normalizePath(a, CFG.minVertices);
+            var preB = b.vertices.length >= CFG.minVertices ? b : normalizePath(b, CFG.minVertices);
+            var nw = nwAlign(preA, preB);
+            aligned.push({ prop: samples[s].prop, src: nw.src, tgt: nw.tgt });
+        }
+
+        // ── Write aligned data back. setValueAtTime updates the key at that
+        //    exact time, so existing keyframes get overwritten in place.
+        for (var s = 0; s < aligned.length; s++) {
+            var e = aligned[s];
+            e.prop.setValueAtTime(t0, aeShape(e.src));
+            e.prop.setValueAtTime(t1, aeShape(e.tgt));
+            applyEase(e.prop, t0, 75);
+            applyEase(e.prop, t1, 75);
+        }
+
+        // ── Even-Odd fill on every fill in the container (no fills added). ────
+        var fills = collectFillsInGroup(container);
+        var fillsTouched = 0;
+        for (var f = 0; f < fills.length; f++) {
+            try { fills[f].property("ADBE Vector Fill Rule").setValue(2); fillsTouched++; } catch (e) { }
+        }
+
+        app.endUndoGroup();
+        return { paths: aligned.length, fills: fillsTouched, grown: staticPaths.length };
+    }
+
+
+    // =========================================================================
+    //  v3.0 REDESIGN  —  Super Morphings-style single-button workflow.
+    //  - Auto-detects layer type and routes to path engine or rig engine
+    //  - Modifier keys: Shift = pair morph, Alt = no anticipation
+    //  - Controller null carries elastic params (no per-morph UI)
+    //  - Single Morph button + Trails + Slice utility buttons
+    // =========================================================================
+
+    var V3 = {
+        controllerName: "OpenMorph Controller",
+        trails: {
+            defaultCount: 5,
+            defaultOffsetFrames: 3,
+            defaultColor: [1, 1, 1],
+            defaultRandom: 10
+        },
+        slice: { defaultCount: 4 },
+        rig: {
+            squashScale: 0.8,
+            preTiltDegrees: 25,
+            durationFrames: { preLaunch: 4, travel: 16, scaleLag: 2, rotationLag: 4 },
+            staggerFrames: 3,
+            elastic: { amplitude: 50, frequency: 2.5, decay: 5 },
+            ease: {
+                holdLaunch: [0, 33],
+                arrival:    [0, 100],
+                scale:      [0, 33],
+                rotation:   [0, 33]
+            }
+        },
+        pathDurationSec: 1.5
+    };
+
+    // ── selection helpers ───────────────────────────────────────────────────
+    function v3GetComp() {
+        var it = app.project.activeItem;
+        return (it && it instanceof CompItem) ? it : null;
+    }
+    function v3GetSelection(comp) {
+        var sel = comp.selectedLayers;
+        if (sel.length < 2) return null;
+        return { sources: sel.slice(0, sel.length - 1), target: sel[sel.length - 1], all: sel };
+    }
+    function v3AllShapes(layers) {
+        for (var i = 0; i < layers.length; i++) {
+            if (!(layers[i] instanceof ShapeLayer)) return false;
+        }
+        return true;
+    }
+    function v3ModifierState() {
+        var ks = ScriptUI.environment.keyboardState;
+        return { shift: !!ks.shiftKey, alt: !!ks.altKey, ctrl: !!(ks.ctrlKey || ks.metaKey) };
+    }
+
+    // ── layer management (shared by rig + utilities) ────────────────────────
+    function v3CenterAnchor(layer) {
+        var t  = layer.containingComp.time;
+        var b  = layer.sourceRectAtTime(t, false);
+        var na = [b.left + b.width / 2, b.top + b.height / 2];
+        var oa = layer.transform.anchorPoint.value;
+        var sc = layer.transform.scale.value;
+        var po = layer.transform.position.value;
+        layer.transform.anchorPoint.setValue(na);
+        layer.transform.position.setValue([
+            po[0] + (na[0] - oa[0]) * sc[0] / 100,
+            po[1] + (na[1] - oa[1]) * sc[1] / 100
+        ]);
+    }
+    function v3Unseparate(p) { if (p.dimensionsSeparated) p.dimensionsSeparated = false; }
+    function v3MoveToTop(l) { if (l.index !== 1) l.moveToBeginning(); }
+    function v3SetEase(prop, keyIdx, pair) {
+        var dim = (prop.value.length || 1);
+        var arr = [];
+        for (var d = 0; d < dim; d++) arr.push(new KeyframeEase(pair[0], pair[1]));
+        prop.setTemporalEaseAtKey(keyIdx, arr, arr);
+    }
+
+    // ── controller null (single, shared) ────────────────────────────────────
+    function v3GetOrBuildController(comp) {
+        for (var i = 1; i <= comp.numLayers; i++) {
+            if (comp.layer(i).name === V3.controllerName) return comp.layer(i);
+        }
+        var n = comp.layers.addNull();
+        n.name = V3.controllerName;
+        n.label = 9;
+        n.guideLayer = true;
+        var fx = n.property("Effects");
+        function slider(name, def) {
+            var s = fx.addProperty("ADBE Slider Control");
+            s.name = name;
+            s.property("Slider").setValue(def);
+        }
+        slider("Amplitude", V3.rig.elastic.amplitude);
+        slider("Frequency", V3.rig.elastic.frequency);
+        slider("Decay",     V3.rig.elastic.decay);
+        return n;
+    }
+    function v3ElasticExpr(ctrlName) {
+        var c = 'thisComp.layer("' + ctrlName + '").effect';
+        return [
+            "try {",
+            "  amp   = " + c + '("Amplitude")("Slider") / 100;',
+            "  freq  = " + c + '("Frequency")("Slider");',
+            "  decay = " + c + '("Decay")("Slider");',
+            "  n = 0;",
+            "  if (numKeys > 0) {",
+            "    n = nearestKey(time).index;",
+            "    if (key(n).time > time) n--;",
+            "  }",
+            "  if (n > 0) {",
+            "    t = time - key(n).time;",
+            "    v = velocityAtTime(key(n).time - thisComp.frameDuration / 10);",
+            "    value + v * amp * Math.sin(freq * t * 2 * Math.PI) / Math.exp(decay * t);",
+            "  } else value;",
+            "} catch (e) { value; }"
+        ].join("\n");
+    }
+
+    // ── rig morph: one source → target ──────────────────────────────────────
+    function v3RigBuildSource(layer, target, time, dur, ctrl,
+                              tPos, tRot, tScale, tBounds, isFirst, useAnticipation) {
+        v3CenterAnchor(layer);
+        var pos = layer.transform.position;
+        var sc  = layer.transform.scale;
+        var rt  = layer.transform.rotation;
+        var op  = layer.transform.opacity;
+        v3Unseparate(pos);
+
+        var cp = pos.value, cs = sc.value, cr = rt.value;
+        var b  = layer.sourceRectAtTime(time, false);
+
+        // POSITION: with anticipation = [hold, hold, fly]; without = [now, fly]
+        var pT, pV, arrivalKey;
+        if (useAnticipation) {
+            pT = [time, time + dur.preLaunch, time + dur.travel];
+            pV = [cp, cp, tPos];
+            arrivalKey = 3;
+        } else {
+            pT = [time, time + dur.travel];
+            pV = [cp, tPos];
+            arrivalKey = 2;
+        }
+        pos.setValuesAtTimes(pT, pV);
+        v3SetEase(pos, 1, V3.rig.ease.holdLaunch);
+        if (useAnticipation) v3SetEase(pos, 2, V3.rig.ease.holdLaunch);
+        v3SetEase(pos, arrivalKey, V3.rig.ease.arrival);
+
+        // SCALE: current → (squash) → match target visible size
+        var newSc = [
+            b.width  > 0 ? tScale[0] * tBounds.width  / b.width  : cs[0],
+            b.height > 0 ? tScale[1] * tBounds.height / b.height : cs[1]
+        ];
+        var sT, sV;
+        if (useAnticipation) {
+            sT = [time, time + dur.preLaunch + dur.scaleLag, time + dur.travel];
+            sV = [cs, [cs[0] * V3.rig.squashScale, cs[1] * V3.rig.squashScale], newSc];
+        } else {
+            sT = [time, time + dur.travel];
+            sV = [cs, newSc];
+        }
+        sc.setValuesAtTimes(sT, sV);
+        for (var k = 1; k <= sT.length; k++) v3SetEase(sc, k, V3.rig.ease.scale);
+
+        // ROTATION: pre-tilt then settle (only with anticipation)
+        var rT, rV;
+        if (useAnticipation) {
+            var dir = (tPos[0] - cp[0]) >= 0 ? 1 : -1;
+            rT = [time, time + dur.preLaunch + dur.rotationLag, time + dur.travel];
+            rV = [cr, cr + dir * V3.rig.preTiltDegrees, tRot];
+        } else {
+            rT = [time, time + dur.travel];
+            rV = [cr, tRot];
+        }
+        rt.setValuesAtTimes(rT, rV);
+        for (var k2 = 1; k2 <= rT.length; k2++) v3SetEase(rt, k2, V3.rig.ease.rotation);
+
+        // OPACITY HANDOFF
+        op.expression =
+            "try { if (time < transform.position.key(" + arrivalKey + ").time) 100; else 0; }" +
+            " catch (e) { value; }";
+        if (isFirst) {
+            target.transform.opacity.expression =
+                'try { 100 - thisComp.layer("' + layer.name + '").transform.opacity }' +
+                " catch (e) { value; }";
+        }
+
+        // ELASTIC OVERSHOOT
+        var elx = v3ElasticExpr(ctrl.name);
+        pos.expression = elx;
+        sc.expression  = elx;
+        rt.expression  = elx;
+    }
+
+    function v3ApplyTargetTracking(target, sources) {
+        var lines = [];
+        for (var i = 0; i < sources.length; i++) {
+            lines.push('  thisComp.layer("' + sources[i].name + '")');
+        }
+        var srcList = lines.join(",\n");
+        function expr(propName) {
+            return [
+                "try {",
+                "  var srcs = [", srcList, "  ];",
+                "  var off = 0;",
+                "  for (var i = 0; i < srcs.length; i++) {",
+                "    var p = srcs[i].transform." + propName + ";",
+                "    if (p.numKeys > 0 && time > p.key(1).time) {",
+                "      off += (p.value - p.key(1).value) / srcs.length;",
+                "    }",
+                "  }",
+                "  value + off;",
+                "} catch (e) { value; }"
+            ].join("\n");
+        }
+        target.transform.position.expression = expr("position");
+        target.transform.scale.expression    = expr("scale");
+        target.transform.rotation.expression = expr("rotation");
+    }
+
+    // ── ENGINE: rig morph all-into-last ─────────────────────────────────────
+    function v3RunRigMorph(comp, sel, useAnticipation) {
+        var f = comp.frameDuration;
+        var dur = {};
+        for (var k in V3.rig.durationFrames) dur[k] = f * V3.rig.durationFrames[k];
+        var stagger = f * V3.rig.staggerFrames;
+
+        var ctrl = v3GetOrBuildController(comp);
+        v3MoveToTop(sel.target);
+        v3CenterAnchor(sel.target);
+        v3Unseparate(sel.target.transform.position);
+
+        var t0      = comp.time;
+        var tPos    = sel.target.transform.position.valueAtTime(t0, false);
+        var tRot    = sel.target.transform.rotation.valueAtTime(t0, false);
+        var tScale  = sel.target.transform.scale.value;
+        var tBounds = sel.target.sourceRectAtTime(t0, false);
+
+        v3ApplyTargetTracking(sel.target, sel.sources);
+
+        for (var i = 0; i < sel.sources.length; i++) {
+            v3RigBuildSource(sel.sources[i], sel.target,
+                             t0 + i * stagger, dur, ctrl,
+                             tPos, tRot, tScale, tBounds, i === 0, useAnticipation);
+        }
+    }
+
+    // ── ENGINE: pair morph (Shift+Click) — pairs (0,1), (2,3), ... ──────────
+    function v3RunPairMorph(comp, layers, useAnticipation) {
+        var f = comp.frameDuration;
+        var dur = {};
+        for (var k in V3.rig.durationFrames) dur[k] = f * V3.rig.durationFrames[k];
+        var pairStagger = f * V3.rig.staggerFrames * 2;
+        var ctrl = v3GetOrBuildController(comp);
+        var t0 = comp.time;
+
+        for (var p = 0; p + 1 < layers.length; p += 2) {
+            var src = layers[p], tgt = layers[p + 1];
+            v3MoveToTop(tgt);
+            v3CenterAnchor(tgt);
+            v3Unseparate(tgt.transform.position);
+            var tPos = tgt.transform.position.valueAtTime(t0, false);
+            var tRot = tgt.transform.rotation.valueAtTime(t0, false);
+            var tScale = tgt.transform.scale.value;
+            var tBounds = tgt.sourceRectAtTime(t0, false);
+            v3ApplyTargetTracking(tgt, [src]);
+            v3RigBuildSource(src, tgt, t0 + (p / 2) * pairStagger,
+                             dur, ctrl, tPos, tRot, tScale, tBounds, true, useAnticipation);
+        }
+    }
+
+    // ── ENGINE: path morph (delegates to existing execSingle) ───────────────
+    function v3RunPathMorph(comp, sel) {
+        if (sel.all.length !== 2) {
+            alert("Path morph requires exactly 2 shape layers.\nSelect source, then target.");
+            return false;
+        }
+        SINGLE.srcLayer = sel.sources[0];
+        SINGLE.tgtLayer = sel.target;
+        SINGLE.srcPaths = getAllPaths(SINGLE.srcLayer);
+        SINGLE.tgtPaths = getAllPaths(SINGLE.tgtLayer);
+        CFG.duration = V3.pathDurationSec;
+        CFG.easing = 33;
+        CFG.matchPosition = true;
+        return execSingle();
+    }
+
+    // ── ENGINE: trails (live expression-driven shape echoes) ────────────────
+    function v3RunTrails() {
+        var comp = v3GetComp();
+        if (!comp) { alert("Open a composition."); return; }
+        var sel = comp.selectedLayers;
+        if (!sel.length) { alert("Select 1+ animated layer to trail."); return; }
+
+        app.beginUndoGroup("OpenMorph: Trails");
+        try {
+            for (var i = 0; i < sel.length; i++) v3BuildTrailLayer(comp, sel[i]);
+        } catch (e) {
+            alert("Trails error: " + e.toString());
+        }
+        app.endUndoGroup();
+    }
+    function v3BuildTrailLayer(comp, srcLayer) {
+        var trail = comp.layers.addShape();
+        trail.name = srcLayer.name + " Trails";
+        trail.label = 13;
+        trail.moveAfter(srcLayer);
+        // Reset trail layer to comp origin so group-space == comp-space in expressions
+        trail.transform.position.setValue([0, 0]);
+        trail.transform.anchorPoint.setValue([0, 0]);
+
+        // controller effects on the trail layer itself
+        var fx = trail.property("Effects");
+        var colorFx = fx.addProperty("ADBE Color Control"); colorFx.name = "Trail Color";
+        colorFx.property("Color").setValue(V3.trails.defaultColor);
+        var countFx = fx.addProperty("ADBE Slider Control"); countFx.name = "Trail Count";
+        countFx.property("Slider").setValue(V3.trails.defaultCount);
+        var offFx   = fx.addProperty("ADBE Slider Control"); offFx.name = "Time Offset";
+        offFx.property("Slider").setValue(V3.trails.defaultOffsetFrames);
+        var randFx  = fx.addProperty("ADBE Slider Control"); randFx.name = "Random Spread";
+        randFx.property("Slider").setValue(V3.trails.defaultRandom);
+        var seedFx  = fx.addProperty("ADBE Slider Control"); seedFx.name = "Random Seed";
+        seedFx.property("Slider").setValue(1);
+
+        // build N ellipses; each samples srcLayer's position at time - i*offset
+        var root = trail.property("ADBE Root Vectors Group");
+        var srcName = srcLayer.name;
+        for (var i = 1; i <= V3.trails.defaultCount; i++) {
+            var grp = root.addProperty("ADBE Vector Group");
+            grp.name = "Echo " + i;
+            var contents = grp.property("ADBE Vectors Group");
+            var ell = contents.addProperty("ADBE Vector Shape - Ellipse");
+            ell.property("ADBE Vector Ellipse Size").setValue([20, 20]);
+            var fill = contents.addProperty("ADBE Vector Graphic - Fill");
+            fill.property("ADBE Vector Fill Color").expression =
+                'effect("Trail Color")("Color")';
+
+            // group transform: position = src position N frames ago + random offset
+            var gT = grp.property("ADBE Vector Transform Group");
+            gT.property("ADBE Vector Position").expression = [
+                "try {",
+                "  var src = thisComp.layer(\"" + srcName + "\");",
+                "  var off = effect(\"Time Offset\")(\"Slider\");",
+                "  var i   = " + i + ";",
+                "  var p   = src.toComp(src.transform.position.valueAtTime(time - i * off * thisComp.frameDuration));",
+                "  seedRandom(effect(\"Random Seed\")(\"Slider\") + i, true);",
+                "  var spread = effect(\"Random Spread\")(\"Slider\");",
+                "  p + [random(-spread, spread), random(-spread, spread)] - position;",
+                "} catch (e) { [0, 0]; }"
+            ].join("\n");
+
+            // opacity fades with index (older echoes more transparent)
+            gT.property("ADBE Vector Group Opacity").expression =
+                "var n = effect(\"Trail Count\")(\"Slider\"); " +
+                "var i = " + i + "; if (i > n) 0; else 100 * (1 - (i-1)/n);";
+        }
+    }
+
+    // ── ENGINE: slice (cut layer into N vertical strips via track mattes) ───
+    function v3RunSlice() {
+        var comp = v3GetComp();
+        if (!comp) { alert("Open a composition."); return; }
+        var sel = comp.selectedLayers;
+        if (!sel.length) { alert("Select 1+ layer to slice."); return; }
+
+        var input = prompt("How many slices?", String(V3.slice.defaultCount));
+        var n = parseInt(input, 10);
+        if (!n || n < 2) return;
+
+        app.beginUndoGroup("OpenMorph: Slice");
+        try {
+            for (var i = 0; i < sel.length; i++) v3SliceOne(comp, sel[i], n);
+        } catch (e) {
+            alert("Slice error: " + e.toString());
+        }
+        app.endUndoGroup();
+    }
+    function v3SliceOne(comp, layer, n) {
+        if (layer.hasVideo === false) return;
+        var t = comp.time;
+        var b = layer.sourceRectAtTime(t, true);
+        if (!b || b.width <= 0) return;
+        var sliceW = b.width / n;
+
+        // hide original, build N duplicates each masked to its strip
+        layer.enabled = false;
+        for (var i = 0; i < n; i++) {
+            var dup = layer.duplicate();
+            dup.enabled = true;
+            dup.name = layer.name + " slice " + (i + 1);
+            dup.moveAfter(layer);
+
+            var mask = dup.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+            mask.name = "Strip " + (i + 1);
+            var x0 = b.left + i * sliceW;
+            var x1 = x0 + sliceW;
+            var y0 = b.top;
+            var y1 = b.top + b.height;
+
+            var shape = new Shape();
+            shape.vertices = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+            shape.inTangents  = [[0,0],[0,0],[0,0],[0,0]];
+            shape.outTangents = [[0,0],[0,0],[0,0],[0,0]];
+            shape.closed = true;
+            mask.property("ADBE Mask Shape").setValue(shape);
+            mask.property("ADBE Mask Mode").setValue(MaskMode.ADD);
+        }
+    }
+
+    // ── MAIN ENTRY POINT (routed from the Morph button) ─────────────────────
+    function v3OnMorphClick() {
+        var comp = v3GetComp();
+        if (!comp) { alert("Open a composition first."); return; }
+        var sel = v3GetSelection(comp);
+        if (!sel) { alert("Select 2 or more layers (last = target)."); return; }
+
+        var mod = v3ModifierState();
+        var useAnticipation = !mod.alt;
+
+        app.beginUndoGroup("OpenMorph: Build");
+        try {
+            if (mod.shift) {
+                // Pair morph: (0,1), (2,3), ...
+                if (sel.all.length < 2 || sel.all.length % 2 !== 0) {
+                    alert("Pair morph needs an even number of layers (2, 4, 6...).");
+                } else {
+                    v3RunPairMorph(comp, sel.all, useAnticipation);
+                }
+            } else if (v3AllShapes(sel.all)) {
+                v3RunPathMorph(comp, sel);
+            } else {
+                v3RunRigMorph(comp, sel, useAnticipation);
+            }
+        } catch (e) {
+            alert("OpenMorph error: " + e.toString());
+        }
+        app.endUndoGroup();
+    }
+
+    // =========================================================================
+    //  UI  —  Minimal single-button panel
     // =========================================================================
     function buildUI(thisObj) {
         var win = (thisObj instanceof Panel)
@@ -1371,423 +2019,67 @@
 
         win.orientation = "column";
         win.alignChildren = ["fill", "top"];
-        win.spacing = 4;
-        win.margins = [8, 8, 8, 8];
+        win.spacing = 6;
+        win.margins = [10, 10, 10, 10];
 
-        // ─── color helpers ────────────────────────────────────────────────────
-        var C = {
-            green: [0.22, 0.82, 0.45],
-            orange: [1.00, 0.60, 0.20],
-            blue: [0.35, 0.65, 1.00],
-            red: [0.90, 0.22, 0.22],
-            gray: [0.55, 0.55, 0.55],
-            yellow: [0.90, 0.80, 0.10],
-            teal: [0.20, 0.80, 0.80]
-        };
-
-        function pen(el, rgb) {
-            try { el.graphics.foregroundColor = el.graphics.newPen(el.graphics.PenType.SOLID_COLOR, [rgb[0], rgb[1], rgb[2], 1], 1); } catch (e) { }
-        }
-
-        // ─── HEADER ──────────────────────────────────────────────────────────
+        // header
         var hdr = win.add("group");
-        hdr.orientation = "row"; hdr.alignChildren = ["left", "center"]; hdr.spacing = 5;
-
-        var titleEl = hdr.add("statictext", undefined, "\u25C6 OpenMorph Pro");
+        hdr.orientation = "row"; hdr.alignChildren = ["left", "center"]; hdr.spacing = 6;
+        var titleEl = hdr.add("statictext", undefined, "◆ OpenMorph Pro");
         titleEl.graphics.font = ScriptUI.newFont("Arial", "BOLD", 13);
+        var verEl = hdr.add("statictext", undefined, "v3.0");
+        try { verEl.graphics.foregroundColor = verEl.graphics.newPen(verEl.graphics.PenType.SOLID_COLOR, [0.55, 0.55, 0.55, 1], 1); } catch (e) {}
 
-        var verEl = hdr.add("statictext", undefined, "v" + VERSION);
-        pen(verEl, C.gray);
+        // hint line
+        var hint = win.add("statictext", undefined, "Select layers → last is target → Morph");
+        hint.alignment = ["fill", "top"];
 
-        // ─── NATIVE TABBED PANEL ─────────────────────────────────────────────
-        var tp = win.add("tabbedpanel");
-        tp.alignChildren = ["fill", "fill"];
-        tp.preferredSize.width = 290;
+        // BIG MORPH BUTTON
+        var morphBtn = win.add("button", undefined, "MORPH IT");
+        morphBtn.preferredSize.height = 44;
+        morphBtn.onClick = v3OnMorphClick;
 
-        // ══════════════════════════════════════════════════════════════════════
-        //  TAB CONTENT  ①  SINGLE
-        //  Compact 2-row layout: FROM row + TO row + swap + mode badge
-        // ══════════════════════════════════════════════════════════════════════
-        var sTab = tp.add("tab", undefined, "\u25C8 Single");
-        sTab.orientation = "column"; sTab.alignChildren = ["fill", "top"];
-        sTab.margins = [6, 8, 6, 6]; sTab.spacing = 5;
+        // modifier-key cheat sheet
+        var cheat = win.add("statictext", undefined,
+            "Shift = pair morph     Alt = no anticipation", { multiline: true });
+        cheat.alignment = ["fill", "top"];
 
-        // ① FROM row
-        var fromRow = sTab.add("group");
-        fromRow.orientation = "row"; fromRow.alignChildren = ["left", "center"]; fromRow.spacing = 5;
-        var fromIcon = fromRow.add("statictext", undefined, "\u2460");
-        pen(fromIcon, C.green);
-        fromRow.add("statictext", undefined, "FROM");
-        var srcLbl = fromRow.add("statictext", undefined, "[ not set ]");
-        srcLbl.preferredSize.width = 108; pen(srcLbl, C.gray);
-        var setSrcBtn = fromRow.add("button", undefined, "\u25B6 Set"); setSrcBtn.preferredSize.width = 44;
+        // utility row: Trails + Slice
+        var utilRow = win.add("group");
+        utilRow.alignment = ["fill", "top"];
+        utilRow.spacing = 4;
+        var trailsBtn = utilRow.add("button", undefined, "Trails");
+        trailsBtn.alignment = ["fill", "center"];
+        trailsBtn.onClick = v3RunTrails;
+        var sliceBtn  = utilRow.add("button", undefined, "Slice");
+        sliceBtn.alignment = ["fill", "center"];
+        sliceBtn.onClick = v3RunSlice;
 
-        var srcInfoLbl = sTab.add("statictext", undefined, "     \u2514 select a Shape Layer, then click Set");
-        pen(srcInfoLbl, C.gray);
-
-        sTab.add("panel", undefined, "").preferredSize.height = 1; // thin divider
-
-        // ② TO row
-        var toRow = sTab.add("group");
-        toRow.orientation = "row"; toRow.alignChildren = ["left", "center"]; toRow.spacing = 5;
-        var toIcon = toRow.add("statictext", undefined, "\u2461");
-        pen(toIcon, C.orange);
-        toRow.add("statictext", undefined, "  TO ");
-        var tgtLbl = toRow.add("statictext", undefined, "[ not set ]");
-        tgtLbl.preferredSize.width = 108; pen(tgtLbl, C.gray);
-        var setTgtBtn = toRow.add("button", undefined, "\u25B6 Set"); setTgtBtn.preferredSize.width = 44;
-
-        var tgtInfoLbl = sTab.add("statictext", undefined, "     \u2514 select a Shape Layer, then click Set");
-        pen(tgtInfoLbl, C.gray);
-
-        // Swap + mode badge
-        var sBotRow = sTab.add("group"); sBotRow.orientation = "row"; sBotRow.alignChildren = ["left", "center"]; sBotRow.spacing = 8;
-        var swapBtn = sBotRow.add("button", undefined, "\u21C4 Swap"); swapBtn.preferredSize.width = 54;
-        var modeBadge = sBotRow.add("statictext", undefined, ""); modeBadge.alignment = ["fill", "center"];
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  TAB CONTENT  ②  CHAIN   A → B → C → D on ONE render layer
-        // ══════════════════════════════════════════════════════════════════════
-        var cTab = tp.add("tab", undefined, "\u21C6 Chain");
-        cTab.orientation = "column"; cTab.alignChildren = ["fill", "top"];
-        cTab.margins = [6, 8, 6, 6]; cTab.spacing = 4;
-
-        var cHint = cTab.add("statictext", undefined, "\u2460 Select layer \u2192 Add Step  (repeat for each shape)");
-        pen(cHint, C.gray);
-
-        var chainList = cTab.add("listbox", undefined, [], { multiselect: false });
-        chainList.preferredSize.height = 75;
-
-        var cRow1 = cTab.add("group"); cRow1.orientation = "row"; cRow1.alignChildren = ["fill", "center"]; cRow1.spacing = 3;
-        var cAddBtn = cRow1.add("button", undefined, "+ Add Step"); cAddBtn.preferredSize.width = 76;
-        var cRemBtn = cRow1.add("button", undefined, "\u2212 Remove");
-        var cUpBtn = cRow1.add("button", undefined, "\u2191"); cUpBtn.preferredSize.width = 26;
-        var cDnBtn = cRow1.add("button", undefined, "\u2193"); cDnBtn.preferredSize.width = 26;
-
-        var cRow2 = cTab.add("group"); cRow2.orientation = "row"; cRow2.alignChildren = ["left", "center"]; cRow2.spacing = 4;
-        cRow2.add("statictext", undefined, "\u2461 Selected step duration:");
-        var stepDurEdit = cRow2.add("edittext", undefined, "1.5"); stepDurEdit.preferredSize.width = 34;
-        cRow2.add("statictext", undefined, "s");
-
-        var cStatusLbl = cTab.add("statictext", undefined, "Add 2+ steps, then Create.");
-        pen(cStatusLbl, C.gray);
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  TAB CONTENT  ③  MULTI   each pair = own render layer + timing
-        // ══════════════════════════════════════════════════════════════════════
-        var mTab = tp.add("tab", undefined, "\u2295 Multi");
-        mTab.orientation = "column"; mTab.alignChildren = ["fill", "top"];
-        mTab.margins = [6, 8, 6, 6]; mTab.spacing = 4;
-
-        var mHint = mTab.add("statictext", undefined, "\u2460 Add a pair, select it, then Set Src and Set Tgt");
-        pen(mHint, C.gray);
-
-        var multiList = mTab.add("listbox", undefined, [], { multiselect: false });
-        multiList.preferredSize.height = 66;
-
-        var mRow1 = mTab.add("group"); mRow1.orientation = "row"; mRow1.alignChildren = ["fill", "center"]; mRow1.spacing = 3;
-        var mAddBtn = mRow1.add("button", undefined, "+ Pair"); mAddBtn.preferredSize.width = 52;
-        var mRemBtn = mRow1.add("button", undefined, "\u2212"); mRemBtn.preferredSize.width = 30;
-        var mSrcBtn = mRow1.add("button", undefined, "\u25B6 Src");
-        var mTgtBtn = mRow1.add("button", undefined, "\u25B6 Tgt");
-
-        var mRow2 = mTab.add("group"); mRow2.orientation = "row"; mRow2.alignChildren = ["left", "center"]; mRow2.spacing = 4;
-        mRow2.add("statictext", undefined, "\u2461 Start:");
-        var mStartEdit = mRow2.add("edittext", undefined, "0.0"); mStartEdit.preferredSize.width = 30;
-        mRow2.add("statictext", undefined, "s");
-        mRow2.add("statictext", undefined, "  Dur:");
-        var mDurEdit = mRow2.add("edittext", undefined, "1.5"); mDurEdit.preferredSize.width = 30;
-        mRow2.add("statictext", undefined, "s  (selected pair)");
-
-        var mStatusLbl = mTab.add("statictext", undefined, "");
-        pen(mStatusLbl, C.gray);
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  SETTINGS ROW  (compact, always visible)
-        // ══════════════════════════════════════════════════════════════════════
-        var setRow = win.add("group"); setRow.orientation = "row"; setRow.alignChildren = ["left", "center"]; setRow.spacing = 4;
-        setRow.add("statictext", undefined, "\u23F1");
-        var durSlider = setRow.add("slider", undefined, 1.5, 0.1, 10); durSlider.preferredSize.width = 76;
-        var durEdit = setRow.add("edittext", undefined, "1.5"); durEdit.preferredSize.width = 28;
-        setRow.add("statictext", undefined, "s");
-        var easeDrop = setRow.add("dropdownlist", undefined, ["Linear", "Easy", "Expo"]);
-        easeDrop.selection = 1; easeDrop.preferredSize.width = 54;
-        var travelChk = setRow.add("checkbox", undefined, "\u21C4 Pos"); travelChk.value = true;
-
-        durSlider.onChanging = function () { durEdit.text = durSlider.value.toFixed(1); CFG.duration = durSlider.value; };
-        durEdit.onChange = function () { var v = parseFloat(durEdit.text); if (!isNaN(v)) { v = Math.max(0.1, Math.min(10, v)); durSlider.value = v; durEdit.text = v.toFixed(1); CFG.duration = v; } };
-        easeDrop.onChange = function () { CFG.easing = [0, 33, 90][easeDrop.selection.index]; };
-        travelChk.onClick = function () { CFG.matchPosition = travelChk.value; };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  STATUS + ACTION
-        // ══════════════════════════════════════════════════════════════════════
-        var statRow = win.add("group"); statRow.orientation = "row"; statRow.alignChildren = ["left", "center"]; statRow.spacing = 4;
-        var dot = statRow.add("statictext", undefined, "\u25CF");
-        var statLbl = statRow.add("statictext", undefined, "Ready"); statLbl.alignment = ["fill", "center"];
-
-        function setStatus(msg, rgb) { statLbl.text = msg; pen(dot, rgb || C.gray); }
-
-        var morphBtn = win.add("button", undefined, "  CREATE MORPH  \u2192");
-        morphBtn.preferredSize.height = 32;
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  POST-MORPH TOOLS  (tiny row at bottom)
-        // ══════════════════════════════════════════════════════════════════════
-        var postRow = win.add("group"); postRow.orientation = "row"; postRow.alignChildren = ["fill", "center"]; postRow.spacing = 3;
-        var revBtn = postRow.add("button", undefined, "\u21BA Reverse");
-        var nudgeBtn = postRow.add("button", undefined, "\u21C0 Nudge");
-        var bakeBtn = postRow.add("button", undefined, "\u2606 Bake");
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  TAB SWITCHING  (native tabbedpanel handles visibility/height)
-        // ══════════════════════════════════════════════════════════════════════
-        var tabStatusMessages = ["From \u2192 To \u2192 Create",
-            "Add Steps \u2192 Create",
-            "Add Pairs \u2192 Create"];
-        tp.onChange = function () {
-            var idx = tp.selection.index;
-            SESSION.mode = ["single", "chain", "multi"][idx];
-            setStatus(tabStatusMessages[idx], C.gray);
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  SINGLE  handlers
-        // ══════════════════════════════════════════════════════════════════════
-        function updateBadge() {
-            if (!SINGLE.srcLayer || !SINGLE.tgtLayer) { modeBadge.text = ""; return; }
-            var sc = SINGLE.srcPaths.length, tc = SINGLE.tgtPaths.length;
-            if (sc === tc) { modeBadge.text = "1:1 \u2022 " + sc + "p"; pen(modeBadge, C.green); }
-            else if (sc < tc) { modeBadge.text = "SPLIT " + sc + "\u2192" + tc + "p"; pen(modeBadge, C.orange); }
-            else { modeBadge.text = "MERGE " + sc + "\u2192" + tc + "p"; pen(modeBadge, C.blue); }
-        }
-
-        setSrcBtn.onClick = function () {
-            var l = getSelectedShapeLayer();
-            if (!l) { setStatus("Select a Shape Layer in the AE timeline first.", C.red); return; }
-            convertToBezier(l); l.label = LBL_GREEN;
-            SINGLE.srcLayer = l; SINGLE.srcPaths = getAllPaths(l);
-            srcLbl.text = l.name.substring(0, 18) + (l.name.length > 18 ? "\u2026" : "");
-            pen(srcLbl, C.green);
-            srcInfoLbl.text = "     \u2514 " + SINGLE.srcPaths.length + " path(s) \u2713 (green label set)";
-            pen(srcInfoLbl, C.green);
-            updateBadge();
-            if (SINGLE.tgtLayer) setStatus("Ready! Hit Create Morph.", C.green);
-            else setStatus("FROM set. Now set \u2461 TO.", C.yellow);
-            if (win instanceof Window) win.layout.layout(true); // only in standalone float; breaks docked panels
-        };
-
-        setTgtBtn.onClick = function () {
-            var l = getSelectedShapeLayer();
-            if (!l) { setStatus("Select a Shape Layer in the AE timeline first.", C.red); return; }
-            convertToBezier(l); l.label = LBL_ORANGE;
-            SINGLE.tgtLayer = l; SINGLE.tgtPaths = getAllPaths(l);
-            tgtLbl.text = l.name.substring(0, 18) + (l.name.length > 18 ? "\u2026" : "");
-            pen(tgtLbl, C.orange);
-            tgtInfoLbl.text = "     \u2514 " + SINGLE.tgtPaths.length + " path(s) \u2713 (orange label set)";
-            pen(tgtInfoLbl, C.orange);
-            updateBadge();
-            if (SINGLE.srcLayer) setStatus("Ready! Hit Create Morph.", C.green);
-            else setStatus("TO set. Now set \u2460 FROM.", C.yellow);
-            if (win instanceof Window) win.layout.layout(true); // only in standalone float; breaks docked panels
-        };
-
-        swapBtn.onClick = function () {
-            var tl = SINGLE.srcLayer; SINGLE.srcLayer = SINGLE.tgtLayer; SINGLE.tgtLayer = tl;
-            var tp = SINGLE.srcPaths; SINGLE.srcPaths = SINGLE.tgtPaths; SINGLE.tgtPaths = tp;
-            var tn;
-            tn = srcLbl.text; srcLbl.text = tgtLbl.text; tgtLbl.text = tn;
-            tn = srcInfoLbl.text; srcInfoLbl.text = tgtInfoLbl.text; tgtInfoLbl.text = tn;
-            pen(srcLbl, SINGLE.srcLayer ? C.green : C.gray);
-            pen(srcInfoLbl, SINGLE.srcLayer ? C.green : C.gray);
-            pen(tgtLbl, SINGLE.tgtLayer ? C.orange : C.gray);
-            pen(tgtInfoLbl, SINGLE.tgtLayer ? C.orange : C.gray);
-            updateBadge();
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  CHAIN  handlers
-        // ══════════════════════════════════════════════════════════════════════
-        function refreshChain() {
-            chainList.removeAll();
-            for (var i = 0; i < CHAIN.steps.length; i++) {
-                var s = CHAIN.steps[i];
-                var tag = i === 0 ? "START " : i === CHAIN.steps.length - 1 ? "END   " : "  \u2193   ";
-                chainList.add("item", tag + " " + s.label + " \u00B7 " + s.duration.toFixed(1) + "s");
-            }
-            var n = CHAIN.steps.length;
-            if (n < 2) { cStatusLbl.text = "Add " + (2 - n) + " more step(s) to enable."; pen(cStatusLbl, C.gray); }
-            else {
-                var tot = 0; for (var i = 0; i < n - 1; i++) tot += CHAIN.steps[i].duration;
-                cStatusLbl.text = n + " steps \u00B7 " + tot.toFixed(1) + "s total \u2713 ready";
-                pen(cStatusLbl, C.green);
-            }
-        }
-
-        cAddBtn.onClick = function () {
-            var l = getSelectedShapeLayer();
-            if (!l) { setStatus("Select a Shape Layer in the timeline.", C.red); return; }
-            convertToBezier(l); l.label = LBL_CHAIN;
-            var paths = getAllPaths(l);
-            var dur = parseFloat(stepDurEdit.text) || CFG.duration;
-            CHAIN.steps.push({ layer: l, paths: paths, label: l.name.substring(0, 14) + " (" + paths.length + "p)", duration: dur });
-            refreshChain();
-            setStatus("Step " + CHAIN.steps.length + " added: " + l.name, C.blue);
-        };
-
-        cRemBtn.onClick = function () {
-            var idx = chainList.selection ? chainList.selection.index : -1;
-            if (idx < 0) { setStatus("Select a step to remove.", C.gray); return; }
-            CHAIN.steps.splice(idx, 1); refreshChain(); setStatus("Step removed.", C.gray);
-        };
-
-        cUpBtn.onClick = function () {
-            var idx = chainList.selection ? chainList.selection.index : -1;
-            if (idx < 1) return;
-            var t = CHAIN.steps[idx - 1]; CHAIN.steps[idx - 1] = CHAIN.steps[idx]; CHAIN.steps[idx] = t;
-            refreshChain(); chainList.selection = idx - 1;
-        };
-
-        cDnBtn.onClick = function () {
-            var idx = chainList.selection ? chainList.selection.index : -1;
-            if (idx < 0 || idx >= CHAIN.steps.length - 1) return;
-            var t = CHAIN.steps[idx + 1]; CHAIN.steps[idx + 1] = CHAIN.steps[idx]; CHAIN.steps[idx] = t;
-            refreshChain(); chainList.selection = idx + 1;
-        };
-
-        stepDurEdit.onChange = function () {
-            var idx = chainList.selection ? chainList.selection.index : -1; if (idx < 0) return;
-            var v = parseFloat(stepDurEdit.text); if (!isNaN(v) && v > 0) { CHAIN.steps[idx].duration = v; refreshChain(); }
-        };
-
-        chainList.onChange = function () {
-            var idx = chainList.selection ? chainList.selection.index : -1;
-            if (idx >= 0) stepDurEdit.text = (CHAIN.steps[idx].duration || CFG.duration).toFixed(1);
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  MULTI  handlers
-        // ══════════════════════════════════════════════════════════════════════
-        function refreshMulti() {
-            multiList.removeAll();
-            for (var i = 0; i < MULTI.pairs.length; i++) {
-                var p = MULTI.pairs[i];
-                var sn = p.srcLayer ? p.srcLayer.name.substring(0, 7) : "?src";
-                var tn = p.tgtLayer ? p.tgtLayer.name.substring(0, 7) : "?tgt";
-                var sc = p.srcPaths ? p.srcPaths.length : 0, tc = p.tgtPaths ? p.tgtPaths.length : 0;
-                var mode = (!p.srcLayer || !p.tgtLayer) ? "--" : (sc === tc ? "1:1" : (sc < tc ? "SPLIT" : "MERGE"));
-                multiList.add("item", "[" + i + "] " + sn + "\u2192" + tn + " [" + mode + "] @" + (p.startSec || 0).toFixed(1) + "s " + (p.duration || CFG.duration).toFixed(1) + "s");
-            }
-            var ready = 0; for (var i = 0; i < MULTI.pairs.length; i++) if (MULTI.pairs[i].srcLayer && MULTI.pairs[i].tgtLayer) ready++;
-            if (!MULTI.pairs.length) { mStatusLbl.text = "No pairs yet."; pen(mStatusLbl, C.gray); }
-            else { mStatusLbl.text = ready + "/" + MULTI.pairs.length + " pairs ready"; pen(mStatusLbl, ready === MULTI.pairs.length ? C.green : C.yellow); }
-        }
-
-        mAddBtn.onClick = function () {
-            MULTI.pairs.push({ srcLayer: null, tgtLayer: null, srcPaths: [], tgtPaths: [], startSec: 0, duration: CFG.duration });
-            refreshMulti(); multiList.selection = MULTI.pairs.length - 1;
-            setStatus("Pair " + MULTI.pairs.length + " added. Set Src then Tgt.", C.blue);
-        };
-
-        mRemBtn.onClick = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1; if (idx < 0) return;
-            MULTI.pairs.splice(idx, 1); refreshMulti(); setStatus("Pair removed.", C.gray);
-        };
-
-        mSrcBtn.onClick = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1;
-            if (idx < 0) { setStatus("Select a pair row first.", C.red); return; }
-            var l = getSelectedShapeLayer();
-            if (!l) { setStatus("Select a Shape Layer in the timeline first.", C.red); return; }
-            convertToBezier(l); l.label = LBL_GREEN;
-            MULTI.pairs[idx].srcLayer = l; MULTI.pairs[idx].srcPaths = getAllPaths(l);
-            refreshMulti(); setStatus("Pair " + (idx + 1) + " source: " + l.name, C.green);
-        };
-
-        mTgtBtn.onClick = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1;
-            if (idx < 0) { setStatus("Select a pair row first.", C.red); return; }
-            var l = getSelectedShapeLayer();
-            if (!l) { setStatus("Select a Shape Layer in the timeline first.", C.red); return; }
-            convertToBezier(l); l.label = LBL_ORANGE;
-            MULTI.pairs[idx].tgtLayer = l; MULTI.pairs[idx].tgtPaths = getAllPaths(l);
-            refreshMulti(); setStatus("Pair " + (idx + 1) + " target: " + l.name, C.orange);
-        };
-
-        mStartEdit.onChange = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1; if (idx < 0) return;
-            var v = parseFloat(mStartEdit.text); if (!isNaN(v)) { MULTI.pairs[idx].startSec = v; refreshMulti(); }
-        };
-
-        mDurEdit.onChange = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1; if (idx < 0) return;
-            var v = parseFloat(mDurEdit.text); if (!isNaN(v) && v > 0) { MULTI.pairs[idx].duration = v; refreshMulti(); }
-        };
-
-        multiList.onChange = function () {
-            var idx = multiList.selection ? multiList.selection.index : -1;
-            if (idx >= 0) {
-                mStartEdit.text = (MULTI.pairs[idx].startSec || 0).toFixed(1);
-                mDurEdit.text = (MULTI.pairs[idx].duration || CFG.duration).toFixed(1);
-            }
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  CREATE MORPH  handler
-        // ══════════════════════════════════════════════════════════════════════
-        morphBtn.onClick = function () {
-            setStatus("Working\u2026", C.yellow);
-            try { win.update(); } catch(e) {} // safe in both Window and docked-Panel mode
-            if (SESSION.mode === "single") {
-                if (!SINGLE.srcLayer || !SINGLE.tgtLayer) { setStatus("Set \u2460 FROM and \u2461 TO first!", C.red); return; }
-                var r = execSingle();
-                if (r) setStatus("\u2713 Done! " + r, C.green); else setStatus("Error \u2014 see alert.", C.red);
-            } else if (SESSION.mode === "chain") {
-                if (CHAIN.steps.length < 2) { setStatus("Add 2+ steps first!", C.red); return; }
-                var r = execChain();
-                if (r) setStatus("\u2713 Chain done! " + r, C.green); else setStatus("Error \u2014 see alert.", C.red);
-            } else {
-                if (!MULTI.pairs.length) { setStatus("Add at least one pair first!", C.red); return; }
-                var r = execMulti();
-                if (r) setStatus("\u2713 Multi done! " + r.length + " layers", C.green); else setStatus("Error \u2014 see alert.", C.red);
-            }
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  POST-MORPH TOOLS  handlers
-        // ══════════════════════════════════════════════════════════════════════
+        // post-morph helpers (kept from v2 — operate on already-built morphs)
+        var postRow = win.add("group");
+        postRow.alignment = ["fill", "top"];
+        postRow.spacing = 4;
+        var optBtn  = postRow.add("button", undefined, "Fix Bool");
+        optBtn.helpTip = "Re-align vertex order on N→M morph keys";
+        optBtn.onClick = function () { try { optimizeBooleanKeys(); } catch (e) { alert(e); } };
+        var revBtn  = postRow.add("button", undefined, "Reverse");
+        revBtn.helpTip = "Reverse target path vertex order";
         revBtn.onClick = function () {
-            var l = (SESSION.mode === "single" && SINGLE.tgtLayer) ? SINGLE.tgtLayer : getSelectedShapeLayer();
-            if (!l) { setStatus("Select a target layer in the timeline.", C.red); return; }
-            var n = reverseTargetPaths(l);
-            if (typeof n === "number") setStatus("Reversed " + n + " path(s) on " + l.name, C.teal);
-            else setStatus(n, C.red);
+            var l = getSelectedShapeLayer();
+            if (l) reverseTargetPaths(l); else alert("Select a shape layer.");
         };
-
+        var nudgeBtn = postRow.add("button", undefined, "Nudge");
+        nudgeBtn.helpTip = "Shift start vertex +1";
         nudgeBtn.onClick = function () {
-            var l = (SESSION.mode === "single" && SINGLE.tgtLayer) ? SINGLE.tgtLayer : getSelectedShapeLayer();
-            if (!l) { setStatus("Select a target layer in the timeline.", C.red); return; }
-            var n = nudgeTargetPaths(l);
-            if (typeof n === "number") setStatus("Nudged +1 vertex on " + n + " path(s)", C.teal);
-            else setStatus(n, C.red);
+            var l = getSelectedShapeLayer();
+            if (l) nudgeTargetPaths(l); else alert("Select a shape layer.");
         };
-
-        bakeBtn.onClick = function () {
-            var msg = bakeSelected();
-            if (msg === "ok") setStatus("\u2713 Null baked \u2014 export ready!", C.green);
-            else setStatus(msg, C.red);
-        };
-
-        // ══════════════════════════════════════════════════════════════════════
-        //  INIT
-        // ══════════════════════════════════════════════════════════════════════
-        tp.selection = sTab;
-        SESSION.mode = "single";
-        setStatus("From \u2192 To \u2192 Create", C.gray);
+        var bakeBtn  = postRow.add("button", undefined, "Bake");
+        bakeBtn.helpTip = "Bake controller values onto render layer";
+        bakeBtn.onClick = function () { try { bakeSelected(); } catch (e) { alert(e); } };
 
         if (win instanceof Window) { win.center(); win.show(); }
         else { win.layout.layout(true); }
-
         return win;
     }
 
